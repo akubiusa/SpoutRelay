@@ -46,6 +46,7 @@ jobs:
         with:
           # Merged: use the base branch (master); not merged: use the PR head SHA
           ref: ${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha }}
+          allow-unsafe-pr-checkout: true
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -84,6 +85,7 @@ jobs:
           # pull_request_target: base branch if merged, PR head SHA if not
           # otherwise (push/pull_request/workflow_dispatch): github.sha
           ref: "${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha || github.sha }}"
+          allow-unsafe-pr-checkout: true
 
       - name: 🏗 Setup MSYS2 / MinGW64
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
