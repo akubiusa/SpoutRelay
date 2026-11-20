@@ -7,85 +7,31 @@ on:
   pull_request:
     branches:
       - master
-  pull_request_target:
-    branches:
-      - master
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - closed
   merge_group:
   workflow_dispatch:
 
-# Because pull_request and pull_request_target would share one group and cancel each other,
-# include event_name so cancellation is independent per event
+# Include event_name so cancellation is independent per event. Only pull_request runs are
+# cancelled when superseded; a newer push to master must never cancel an in-flight tag/release.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  calc-version:
-    name: 🔢 Calculate next version
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request_target'
-    permissions:
-      contents: write
-
-    outputs:
-      tag: ${{ steps.tag-version.outputs.new_tag }}
-      changelog: ${{ steps.tag-version.outputs.changelog }}
-
-    steps:
-      - name: 🛎 Checkout
-        id: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Merged: use the base branch (master); not merged: use the PR head SHA
-          ref: ${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha }}
-          allow-unsafe-pr-checkout: true
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🏷 Bump version and push tag
-        id: tag-version
-        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: "minor"
-          custom_release_rules: "feat:minor:✨ Features,fix:patch:🐛 Fixes,docs:patch:📰 Docs,chore:patch:🎨 Chore,perf:patch:🎈 Performance improvements,refactor:patch:🧹 Refactoring,build:patch:🔍 Build,ci:patch:🔍 CI,revert:patch:⏪ Revert,style:patch:🧹 Style,test:patch:👀 Test,release:major:📦 Release"
-          # Create the tag only when merged (dry run while the PR is open)
-          dry_run: ${{ github.event.pull_request.merged == true && 'false' || 'true' }}
-          # GITHUB_SHA of pull_request_target may not point at the post-merge HEAD, so specify it explicitly
-          commit_sha: ${{ steps.checkout.outputs.commit }}
-
-  cpp-build:
+  build:
     name: 🏗️ Build & Test (Windows / MinGW64)
     runs-on: windows-latest
-    needs:
-      - calc-version
-    # calc-version can be skipped (push/pull_request/workflow_dispatch events), so
-    # treat skipped as success. Also skip the build for closed, unmerged PRs
-    if: >-
-      always() &&
-      (needs.calc-version.result == 'success' || needs.calc-version.result == 'skipped') &&
-      (github.event.action != 'closed' || github.event.pull_request.merged == true)
+    # Runs PR-controlled code, so it only ever gets a read-only token
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: 🛎 Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # pull_request_target: base branch if merged, PR head SHA if not
-          # otherwise (push/pull_request/workflow_dispatch): github.sha
-          ref: "${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha || github.sha }}"
-          allow-unsafe-pr-checkout: true
 
       - name: 🏗 Setup MSYS2 / MinGW64
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
@@ -164,23 +110,70 @@ jobs:
           name: spout-relay-win64
           path: dist/
 
+  calc-version:
+    name: 🔢 Calculate next version
+    runs-on: ubuntu-latest
+    # Tag only on trusted master pushes, and only after the build succeeded
+    if: github.event_name == 'push'
+    needs:
+      - build
+    permissions:
+      contents: write
+
+    outputs:
+      tag: ${{ steps.tag-version.outputs.new_tag }}
+      changelog: ${{ steps.tag-version.outputs.changelog }}
+
+    steps:
+      - name: 🛎 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: 🏷 Bump version and push tag
+        id: tag-version
+        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: "minor"
+          custom_release_rules: "feat:minor:✨ Features,fix:patch:🐛 Fixes,docs:patch:📰 Docs,chore:patch:🎨 Chore,perf:patch:🎈 Performance improvements,refactor:patch:🧹 Refactoring,build:patch:🔍 Build,ci:patch:🔍 CI,revert:patch:⏪ Revert,style:patch:🧹 Style,test:patch:👀 Test,release:major:📦 Release"
+          dry_run: false
+          commit_sha: ${{ github.sha }}
+
+  release:
+    name: 🎉 Create GitHub Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs:
+      - build
+      - calc-version
+    permissions:
+      contents: write
+
+    steps:
+      - name: 🛎 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 📥 Download artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: spout-relay-win64
+          path: dist
+
       - name: 📦 Package release archive
         id: package
-        if: github.event.pull_request.merged == true
-        shell: pwsh
+        env:
+          TAG: ${{ needs.calc-version.outputs.tag }}
         run: |
-          $VERSION = "${{ needs.calc-version.outputs.tag }}"
-          $ARCHIVE = "spout-relay-${VERSION}-win64.zip"
-          # dist/ holds the stripped EXE and DLLs from the previous step
-          if (Test-Path config\config.example.json) { Copy-Item config\config.example.json dist\ }
-          if (Test-Path README.md) { Copy-Item README.md dist\ }
-          Compress-Archive -Path dist\* -DestinationPath $ARCHIVE -Force
-          "archive=$ARCHIVE" >> $env:GITHUB_OUTPUT
-          $count = (Get-ChildItem dist).Count
-          Write-Host "Packaged $count files into $ARCHIVE"
+          ARCHIVE="spout-relay-${TAG}-win64.zip"
+          # dist/ holds the stripped EXE and DLLs downloaded from the build job
+          if [ -f config/config.example.json ]; then cp config/config.example.json dist/; fi
+          if [ -f README.md ]; then cp README.md dist/; fi
+          (cd dist && zip -r "../${ARCHIVE}" .)
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "Packaged $(find dist -type f | wc -l) files into ${ARCHIVE}"
 
       - name: 🎉 Create GitHub Release
-        if: github.event.pull_request.merged == true
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -197,22 +190,28 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - build
       - calc-version
-      - cpp-build
+      - release
 
     steps:
       - name: 🔍 Check build status
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CALC_RESULT: ${{ needs.calc-version.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
         run: |
-          calc_result="${{ needs.calc-version.result }}"
-          build_result="${{ needs.cpp-build.result }}"
-          echo "calc-version: $calc_result"
-          echo "cpp-build: $build_result"
-          if [ "$calc_result" != "success" ] && [ "$calc_result" != "skipped" ]; then
-            echo "Version calculation failed"
-            exit 1
-          fi
-          if [ "$build_result" != "success" ] && [ "$build_result" != "skipped" ]; then
+          echo "build: $BUILD_RESULT"
+          echo "calc-version: $CALC_RESULT"
+          echo "release: $RELEASE_RESULT"
+          if [ "$BUILD_RESULT" != "success" ]; then
             echo "Build/test failed"
             exit 1
           fi
-
+          # calc-version and release are skipped on non-push events
+          for result in "$CALC_RESULT" "$RELEASE_RESULT"; do
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "Version calculation or release failed"
+              exit 1
+            fi
+          done
